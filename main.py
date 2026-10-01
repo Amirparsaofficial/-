@@ -9,22 +9,19 @@ import asyncio
 import base64
 import hashlib
 import hmac
-import ipaddress
 import json
 import logging
 import os
 import secrets
-import socket
 import sys
 import time
 from collections import defaultdict, deque
 from datetime import datetime, timedelta
 from pathlib import Path
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 import httpx
-import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
@@ -100,7 +97,15 @@ async def load_state():
             data = json.loads(raw)
             loaded_links = data.get("links", {})
             loaded_subs = data.get("subs", {})
-            BOT_SETTINGS.update(data.get("telegram", {}))
+            # The bot token is intentionally never persisted to disk.  Keep a
+            # token supplied through the environment instead of overwriting it
+            # with the redacted empty token from a previous state save.
+            saved_telegram = data.get("telegram", {})
+            if isinstance(saved_telegram, dict):
+                for key in ("enabled", "admin_ids"):
+                    if key in saved_telegram:
+                        BOT_SETTINGS[key] = saved_telegram[key]
+            BOT_SETTINGS["enabled"] = bool(BOT_SETTINGS.get("token")) and bool(BOT_SETTINGS.get("enabled"))
 
             for item in loaded_links.values():
                 if item.get("protocol") == "xhttp-stream-one":
@@ -290,7 +295,7 @@ async def startup():
     from xhttp_siz10 import ensure_reaper
     ensure_reaper()
 
-    if BOT_SETTINGS.get("token"):
+    if BOT_SETTINGS.get("token") and BOT_SETTINGS.get("enabled"):
         try:
             from telegram_bot import start_bot
             asyncio.create_task(start_bot())
@@ -1171,8 +1176,12 @@ async def telegram_settings(request: Request, _=Depends(require_auth)):
     await save_state()
 
     try:
-        from telegram_bot import configure_bot
-        await configure_bot(token, admin_ids)
+        if BOT_SETTINGS["enabled"]:
+            from telegram_bot import configure_bot
+            await configure_bot(token, admin_ids)
+        else:
+            from telegram_bot import stop_bot
+            await stop_bot()
     except Exception as e:
         logger.warning(f"Could not configure Telegram bot: {e}")
 
@@ -1278,6 +1287,10 @@ async def make_link(
     fp = (fingerprint or DEFAULT_FINGERPRINT).strip()
     if fp not in FINGERPRINTS:
         fp = DEFAULT_FINGERPRINT
+    if sub_id:
+        async with SUBS_LOCK:
+            if sub_id not in SUBS:
+                raise HTTPException(status_code=400, detail="گروه اشتراک یافت نشد")
 
     link_data = {
         "label": label or "کانفیگ Technamooz",
@@ -1567,22 +1580,26 @@ async def assign_link_to_sub(sub_id: str, request: Request, _=Depends(require_au
     link_id = body.get("link_id")
     action = body.get("action", "add")
 
+    if action not in {"add", "remove"}:
+        raise HTTPException(status_code=400, detail="عملیات نامعتبر است")
+    if not isinstance(link_id, str):
+        raise HTTPException(status_code=400, detail="شناسه کانفیگ نامعتبر است")
     async with SUBS_LOCK:
-        sub = SUBS.get(sub_id)
-        if not sub:
+        if sub_id not in SUBS:
             raise HTTPException(status_code=404, detail="گروه یافت نشد")
-        if not isinstance(link_id, str):
-            raise HTTPException(status_code=400, detail="شناسه کانفیگ نامعتبر است")
-        async with LINKS_LOCK:
-            if link_id not in LINKS:
-                raise HTTPException(status_code=404, detail="کانفیگ یافت نشد")
-        lids = sub.setdefault("link_ids", [])
-        if action == "add" and link_id not in lids:
-            lids.append(link_id)
-        elif action == "remove" and link_id in lids:
-            lids.remove(link_id)
+    async with LINKS_LOCK:
+        if link_id not in LINKS:
+            raise HTTPException(status_code=404, detail="کانفیگ یافت نشد")
 
-    await save_state()
+    # Use the canonical helper so both sides of the relationship stay in sync.
+    if action == "add":
+        ok = await set_link_sub(link_id, sub_id)
+    else:
+        async with LINKS_LOCK:
+            belongs_to_group = LINKS[link_id].get("sub_id") == sub_id
+        ok = await set_link_sub(link_id, None) if belongs_to_group else True
+    if not ok:
+        raise HTTPException(status_code=409, detail="همگام‌سازی گروه انجام نشد")
     return {"ok": True}
 
 
